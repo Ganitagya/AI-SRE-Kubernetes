@@ -27,3 +27,19 @@ class DiagnosisResult(BaseModel):
     severity: Optional[SeverityLevel] = None
     confidence: Optional[float] = None
     raw_diagnostics: Optional[dict] = None
+
+
+class InvestigationResult(BaseModel):
+    """Structured output from the Kubernetes investigation layer."""
+    pods: dict = {}
+    logs: dict = {}
+    events: dict = {}
+    deployments: dict = {}
+    network: dict = {}
+
+
+class InvestigationResponse(BaseModel):
+    """API response for investigation requests."""
+    status: str
+    investigation: InvestigationResult
+

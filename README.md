@@ -78,3 +78,21 @@ cd frontend
 npm install
 npm run dev
 ```
+
+## Running against Local Clusters (vcluster, minikube, kind)
+
+If you are running the project via **Docker Compose** and trying to connect to a cluster running locally on your machine (like vcluster, minikube, or kind), your local `kubectl` port-forward must be configured to accept external connections from Docker.
+
+By default, local port-forwards only bind to `127.0.0.1`. You must append `--address 0.0.0.0` when opening the tunnel.
+
+**Example for vcluster:**
+```bash
+vcluster connect my-vcluster --address 0.0.0.0
+```
+
+**Example for standard kubectl:**
+```bash
+kubectl port-forward svc/my-service 8443:8443 --address 0.0.0.0
+```
+
+*Note: You do not need to modify your `~/.kube/config`. The Docker backend automatically translates `localhost` to `host.docker.internal` in memory so it can reach your host machine.*
