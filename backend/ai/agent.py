@@ -1,35 +1,630 @@
 """
-AI reasoning layer – placeholder.
+AI Kubernetes Agent – Senior SRE reasoning layer.
 
-This module will contain logic to:
-- Build prompt context from Kubernetes diagnostics
-- Call LLM via OpenRouter
-- Parse and return structured root cause + suggested fix
+This module implements:
+- Prompt Builder: Creates structured prompts for LLM
+- LLM Client: HTTPX-based OpenRouter client with retries/timeout
+- Root Cause Analyzer: Correlates evidence from investigation payload
+- Fix Recommendation Engine: Generates actionable kubectl commands
+- Confidence Engine: Produces confidence scores with reasoning
 """
 
+import json
+import logging
+from typing import Any
+from dataclasses import dataclass
 
-async def analyze_cluster(diagnostics: dict) -> dict:
+import httpx
+from loguru import logger
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from core.config import settings
+
+
+# ---------------------------------------------------------------------------
+# LLM Client – OpenRouter with HTTPX
+# ---------------------------------------------------------------------------
+
+class OpenRouterClient:
+    """OpenRouter API client with timeout, retries, and error handling."""
+    
+    def __init__(self, api_key: str | None = None, model: str | None = None):
+        self.api_key = api_key or settings.OPENROUTER_API_KEY
+        self.model = model or settings.OPENROUTER_MODEL
+        self.base_url = "https://openrouter.ai/api/v1"
+        
+        if not self.api_key:
+            raise ValueError("OPENROUTER_API_KEY not configured")
+    
+    def _get_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://ai-sre-kubernetes.local",
+            "X-Title": "AI Kubernetes Agent"
+        }
+    
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError)),
+        reraise=True
+    )
+    async def chat_completion(self, prompt: str, temperature: float = 0.1) -> str:
+        """
+        Send prompt to OpenRouter and return the response text.
+        
+        Args:
+            prompt: The full prompt to send
+            temperature: LLM temperature (low for deterministic output)
+            
+        Returns:
+            The assistant's response text
+            
+        Raises:
+            httpx.HTTPStatusError: On non-2xx response after retries
+            httpx.TimeoutException: On timeout after retries
+            ValueError: If API key is missing
+        """
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self._get_system_prompt()},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": 2000
+        }
+        
+        timeout = httpx.Timeout(30.0, connect=10.0)
+        
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            logger.debug(f"Calling OpenRouter API with model: {self.model}")
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers=self._get_headers(),
+                json=payload
+            )
+            
+            if response.status_code == 401:
+                raise ValueError("Invalid OpenRouter API key")
+            elif response.status_code == 429:
+                raise httpx.HTTPStatusError("Rate limited", request=response.request, response=response)
+            elif response.status_code >= 500:
+                raise httpx.HTTPStatusError(f"Server error: {response.status_code}", request=response.request, response=response)
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content:
+                raise ValueError("Empty response from OpenRouter")
+            
+            logger.debug(f"OpenRouter response received ({len(content)} chars)")
+            return content.strip()
+    
+    def _get_system_prompt(self) -> str:
+        return """You are a Senior Kubernetes Site Reliability Engineer with 15+ years of experience troubleshooting production clusters.
+
+Your expertise includes:
+- Deep knowledge of Kubernetes internals (scheduler, kubelet, controllers, CNI, CSI)
+- Container runtime debugging (containerd, CRI-O, Docker)
+- Linux kernel, networking, and storage subsystems
+- Distributed systems failure patterns
+
+When analyzing Kubernetes failures:
+1. CORRELATE evidence across pods, logs, events, deployments, and networking
+2. IDENTIFY the primary root cause (not just symptoms)
+3. PROVIDE specific, actionable fixes with exact kubectl commands
+4. EXPLAIN the failure mechanism clearly
+5. SUGGEST prevention strategies
+6. ASSIGN a confidence score based on evidence strength
+
+Output format (JSON only, no markdown):
+{
+  "root_cause": "Concise root cause statement",
+  "explanation": "Detailed technical explanation of why this happened",
+  "fix": "Actionable fix description",
+  "kubectl_command": "Exact kubectl command to apply the fix",
+  "prevention": "Prevention recommendation",
+  "confidence": 85,
+  "severity": "high"
+}
+
+Severity levels: critical, high, medium, low
+Confidence: 0-100 integer"""
+
+
+# ---------------------------------------------------------------------------
+# Prompt Builder
+# ---------------------------------------------------------------------------
+
+def build_prompt(diagnostics: dict[str, Any]) -> str:
     """
-    Send cluster diagnostics to the LLM for reasoning.
-
+    Build a structured Kubernetes troubleshooting prompt from investigation data.
+    
     Args:
-        diagnostics: Raw data collected from the Kubernetes layer.
-
+        diagnostics: Investigation payload with pods, logs, events, deployments, network
+        
     Returns:
-        dict with keys: root_cause, suggested_fix, confidence
+        Formatted prompt string for the LLM
     """
-    pass
+    sections = []
+    
+    # Pods section
+    pods = diagnostics.get("pods", {})
+    if pods:
+        problematic = pods.get("problematic_pods", [])
+        total = pods.get("total_pods", 0)
+        healthy = pods.get("healthy", True)
+        
+        sections.append("=== POD STATUS ===")
+        sections.append(f"Total pods: {total}")
+        sections.append(f"Healthy: {healthy}")
+        if problematic:
+            sections.append("Problematic pods:")
+            for p in problematic:
+                sections.append(f"  - {p.get('name', 'unknown')}: {p.get('status', 'unknown')}")
+        else:
+            sections.append("No problematic pods found")
+    
+    # Logs section
+    logs = diagnostics.get("logs", {})
+    if logs:
+        sections.append("\n=== POD LOGS ===")
+        for pod_name, log_content in logs.items():
+            sections.append(f"\n--- {pod_name} ---")
+            # Truncate very long logs
+            truncated = log_content[:3000] if len(log_content) > 3000 else log_content
+            sections.append(truncated)
+            if len(log_content) > 3000:
+                sections.append(f"... (truncated, {len(log_content)} total chars)")
+    
+    # Events section
+    events = diagnostics.get("events", {})
+    if events:
+        anomalies = events.get("recent_anomalies", [])
+        found = events.get("anomalies_found", False)
+        
+        sections.append("\n=== KUBERNETES EVENTS ===")
+        sections.append(f"Anomalies found: {found}")
+        if anomalies:
+            for e in anomalies[:20]:  # Limit to 20 most relevant
+                sections.append(f"  - [{e.get('reason', 'Unknown')}] {e.get('object', 'unknown')}: {e.get('message', '')} (count: {e.get('count', 1)})")
+        else:
+            sections.append("No warning events found")
+    
+    # Deployments section
+    deployments = diagnostics.get("deployments", {})
+    if deployments:
+        unhealthy = deployments.get("unhealthy_deployments", [])
+        total = deployments.get("total_deployments", 0)
+        healthy = deployments.get("healthy", True)
+        
+        sections.append("\n=== DEPLOYMENT HEALTH ===")
+        sections.append(f"Total deployments: {total}")
+        sections.append(f"Healthy: {healthy}")
+        if unhealthy:
+            sections.append("Unhealthy deployments:")
+            for d in unhealthy:
+                sections.append(f"  - {d.get('name', 'unknown')}: desired={d.get('desired_replicas', 0)}, ready={d.get('ready_replicas', 0)}, unavailable={d.get('unavailable_replicas', 0)}")
+        else:
+            sections.append("All deployments healthy")
+    
+    # Network section
+    network = diagnostics.get("network", {})
+    if network:
+        issues = network.get("issues", [])
+        total = network.get("total_services", 0)
+        healthy = network.get("healthy", True)
+        
+        sections.append("\n=== NETWORKING ===")
+        sections.append(f"Total services: {total}")
+        sections.append(f"Healthy: {healthy}")
+        if issues:
+            sections.append("Network issues:")
+            for i in issues:
+                sections.append(f"  - {i.get('service', 'unknown')}: {i.get('issue', 'unknown')}")
+        else:
+            sections.append("No networking issues detected")
+    
+    prompt = "\n".join(sections)
+    
+    prompt += """
+
+=== TASK ===
+Analyze the above Kubernetes diagnostic data and provide a structured diagnosis.
+
+Think step by step:
+1. What is the PRIMARY root cause? (Not symptoms - the actual cause)
+2. How do the pieces of evidence correlate to support this?
+3. What is the exact fix needed?
+4. What kubectl command implements this fix?
+5. How can this be prevented?
+6. What is your confidence (0-100) based on evidence strength?
+7. What severity level (critical/high/medium/low)?
+
+Return ONLY the JSON object specified in the system prompt."""
+    
+    return prompt
 
 
-def build_prompt(diagnostics: dict) -> str:
-    """
-    Build an LLM prompt from Kubernetes diagnostic data.
-    """
-    pass
+# ---------------------------------------------------------------------------
+# Root Cause Analyzer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EvidenceCorrelation:
+    """Represents correlated evidence pointing to a root cause."""
+    root_cause: str
+    supporting_evidence: list[str]
+    confidence_boost: int
 
 
-def parse_response(raw_response: str) -> dict:
+def analyze_root_cause(diagnostics: dict[str, Any]) -> EvidenceCorrelation:
     """
-    Parse the LLM text response into a structured result.
+    Correlate evidence from investigation payload to identify root cause.
+    
+    This performs heuristic analysis before sending to LLM to provide
+    structured context and validate LLM output.
     """
-    pass
+    evidence = []
+    root_cause = "Unknown"
+    confidence_boost = 0
+    
+    # Check pod statuses
+    pods = diagnostics.get("pods", {})
+    problematic_pods = pods.get("problematic_pods", [])
+    
+    for pod in problematic_pods:
+        status = pod.get("status", "")
+        pod_name = pod.get("name", "unknown")
+        
+        if "CrashLoopBackOff" in status:
+            evidence.append(f"Pod {pod_name} in CrashLoopBackOff - application crashing on startup")
+            confidence_boost += 15
+            root_cause = "Application crash on startup"
+        elif "ImagePullBackOff" in status or "ErrImagePull" in status:
+            evidence.append(f"Pod {pod_name} cannot pull image - image registry/auth issue")
+            confidence_boost += 20
+            root_cause = "Container image pull failure"
+        elif "OOMKilled" in status:
+            evidence.append(f"Pod {pod_name} OOMKilled - memory limit exceeded")
+            confidence_boost += 15
+            root_cause = "Out of memory (OOM) kill"
+        elif "Pending" in status:
+            evidence.append(f"Pod {pod_name} stuck in Pending - scheduling issue")
+            confidence_boost += 10
+            root_cause = "Pod scheduling failure"
+    
+    # Check logs for specific errors
+    logs = diagnostics.get("logs", {})
+    for pod_name, log_content in logs.items():
+        log_lower = log_content.lower()
+        if "database_url" in log_lower or "connection refused" in log_lower or "connect.*database" in log_lower:
+            evidence.append(f"Pod {pod_name} logs show database connection failure")
+            confidence_boost += 15
+            if "missing" in log_lower or "not set" in log_lower:
+                root_cause = "Missing DATABASE_URL environment variable"
+                confidence_boost += 10
+        elif "permission denied" in log_lower or "access denied" in log_lower:
+            evidence.append(f"Pod {pod_name} logs show permission/access issue")
+            confidence_boost += 10
+            root_cause = "Permission or RBAC issue"
+        elif "configmap" in log_lower and ("not found" in log_lower or "missing" in log_lower):
+            evidence.append(f"Pod {pod_name} logs show missing ConfigMap")
+            confidence_boost += 15
+            root_cause = "Missing ConfigMap or Secret"
+        elif "out of memory" in log_lower or "oom" in log_lower:
+            evidence.append(f"Pod {pod_name} logs confirm OOM")
+            confidence_boost += 10
+    
+    # Check events
+    events = diagnostics.get("events", {})
+    anomalies = events.get("recent_anomalies", [])
+    for event in anomalies:
+        reason = event.get("reason", "")
+        msg = event.get("message", "")
+        obj = event.get("object", "")
+        
+        if "FailedScheduling" in reason:
+            evidence.append(f"Event: {obj} - {reason}: {msg}")
+            confidence_boost += 10
+            root_cause = "Pod scheduling failure (resource constraints or node affinity)"
+        elif "FailedMount" in reason:
+            evidence.append(f"Event: {obj} - {reason}: {msg}")
+            confidence_boost += 10
+            root_cause = "Volume mount failure"
+        elif "BackOff" in reason:
+            evidence.append(f"Event: {obj} - {reason}: {msg}")
+            confidence_boost += 5
+    
+    # Check deployments
+    deployments = diagnostics.get("deployments", {})
+    unhealthy_deps = deployments.get("unhealthy_deployments", [])
+    for dep in unhealthy_deps:
+        evidence.append(f"Deployment {dep.get('name')}: {dep.get('unavailable_replicas', 0)} unavailable replicas")
+        confidence_boost += 5
+    
+    # Check network
+    network = diagnostics.get("network", {})
+    issues = network.get("issues", [])
+    for issue in issues:
+        evidence.append(f"Network: {issue.get('service')} - {issue.get('issue')}")
+        confidence_boost += 10
+        if "selector mismatch" in issue.get("issue", "").lower():
+            root_cause = "Service selector mismatch - pods not matching service selector"
+            confidence_boost += 5
+    
+    return EvidenceCorrelation(
+        root_cause=root_cause,
+        supporting_evidence=evidence,
+        confidence_boost=min(confidence_boost, 50)  # Cap heuristic boost
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix Recommendation Engine
+# ---------------------------------------------------------------------------
+
+def recommend_fix(root_cause: str, diagnostics: dict[str, Any]) -> tuple[str, str]:
+    """
+    Generate actionable fix and kubectl command based on root cause.
+    
+    Returns:
+        Tuple of (fix_description, kubectl_command)
+    """
+    rc_lower = root_cause.lower()
+    
+    # Database/env var issues
+    if "database_url" in rc_lower or "environment variable" in rc_lower or "missing env" in rc_lower:
+        pods = diagnostics.get("pods", {}).get("problematic_pods", [])
+        pod_name = pods[0].get("name", "your-pod") if pods else "your-pod"
+        # Try to find deployment name
+        deployments = diagnostics.get("deployments", {}).get("unhealthy_deployments", [])
+        dep_name = deployments[0].get("name", "your-deployment") if deployments else "your-deployment"
+        
+        fix = "Add the missing DATABASE_URL environment variable to the deployment"
+        cmd = f"kubectl set env deployment/{dep_name} DATABASE_URL=your-database-url"
+        return fix, cmd
+    
+    # Image pull issues
+    if "image pull" in rc_lower or "imagepull" in rc_lower or "errimagepull" in rc_lower:
+        pods = diagnostics.get("pods", {}).get("problematic_pods", [])
+        pod_name = pods[0].get("name", "your-pod") if pods else "your-pod"
+        
+        fix = "Fix container image reference or provide image pull secrets"
+        cmd = ("kubectl describe pod " + pod_name + "  # Check image name and pull secrets\n"
+               "kubectl create secret docker-registry regcred --docker-server=<registry> --docker-username=<user> --docker-password=<pass> --docker-email=<email>\n"
+               "kubectl patch serviceaccount default -p '{\\\"imagePullSecrets\\\": [{\\\"name\\\": \\\"regcred\\\"}]}'")
+        return fix, cmd
+    
+    # OOM issues
+    if "oom" in rc_lower or "memory" in rc_lower:
+        pods = diagnostics.get("pods", {}).get("problematic_pods", [])
+        dep_name = "your-deployment"
+        deployments = diagnostics.get("deployments", {}).get("unhealthy_deployments", [])
+        if deployments:
+            dep_name = deployments[0].get("name", "your-deployment")
+        
+        fix = "Increase memory limits for the container"
+        cmd = f"kubectl set resources deployment/{dep_name} --limits=memory=512Mi --requests=memory=256Mi  # Adjust values as needed"
+        return fix, cmd
+    
+    # Scheduling issues
+    if "schedul" in rc_lower or "pending" in rc_lower:
+        fix = "Resolve scheduling constraints - check node resources, taints/tolerations, affinity rules"
+        cmd = "kubectl describe pod <pod-name>  # Check events for scheduling reason\nkubectl get nodes -o wide  # Check node capacity\nkubectl describe node <node-name>  # Check taints"
+        return fix, cmd
+    
+    # Volume mount issues
+    if "volume" in rc_lower or "mount" in rc_lower:
+        fix = "Fix volume configuration - check PVC binding, storage class, volume permissions"
+        cmd = "kubectl get pvc -n <namespace>  # Check PVC status\nkubectl describe pvc <pvc-name>  # Check events\nkubectl get storageclass  # Check available storage classes"
+        return fix, cmd
+    
+    # Service selector mismatch
+    if "selector" in rc_lower or "service" in rc_lower:
+        network = diagnostics.get("network", {})
+        issues = network.get("issues", [])
+        svc_name = issues[0].get("service", "your-service") if issues else "your-service"
+        
+        fix = "Fix service selector to match pod labels"
+        cmd = f"kubectl get pods --show-labels  # Check pod labels\nkubectl get svc {svc_name} -o yaml  # Check service selector\nkubectl patch svc {svc_name} -p '{{\"spec\": {{\"selector\": {{\"app\": \"your-app-label\"}}}}}}'  # Update selector"
+        return fix, cmd
+    
+    # Permission/RBAC issues
+    if "permission" in rc_lower or "rbac" in rc_lower or "access denied" in rc_lower:
+        fix = "Grant required RBAC permissions via Role/ClusterRole binding"
+        cmd = "kubectl auth can-i <verb> <resource> --as=<service-account> -n <namespace>  # Check permissions\nkubectl create rolebinding <name> --role=<role> --serviceaccount=<ns>:<sa> -n <namespace>"
+        return fix, cmd
+    
+    # ConfigMap/Secret missing
+    if "configmap" in rc_lower or "secret" in rc_lower:
+        fix = "Create missing ConfigMap or Secret and mount it to the pod"
+        cmd = "kubectl create configmap <name> --from-literal=key=value -n <namespace>\n# OR\nkubectl create secret generic <name> --from-literal=key=value -n <namespace>"
+        return fix, cmd
+    
+    # Generic fallback
+    fix = "Investigate the root cause further using kubectl describe and logs"
+    cmd = "kubectl describe pod <pod-name> -n <namespace>\nkubectl logs <pod-name> -n <namespace> --previous"
+    return fix, cmd
+
+
+# ---------------------------------------------------------------------------
+# Confidence Engine
+# ---------------------------------------------------------------------------
+
+def calculate_confidence(
+    correlation: EvidenceCorrelation,
+    llm_confidence: int | None = None
+) -> tuple[int, str]:
+    """
+    Calculate final confidence score with reasoning.
+    
+    Args:
+        correlation: Evidence correlation from analyzer
+        llm_confidence: Optional confidence from LLM response
+        
+    Returns:
+        Tuple of (confidence_score, reasoning)
+    """
+    base_confidence = 50  # Base confidence
+    
+    # Add heuristic boost from evidence correlation
+    base_confidence += correlation.confidence_boost
+    
+    # Factor in LLM confidence if available
+    if llm_confidence is not None:
+        # Weighted average: 60% LLM, 40% heuristic
+        final_confidence = int(0.6 * llm_confidence + 0.4 * base_confidence)
+    else:
+        final_confidence = base_confidence
+    
+    # Clamp to 0-100
+    final_confidence = max(0, min(100, final_confidence))
+    
+    # Build reasoning
+    reasoning_parts = [f"Base confidence: {base_confidence}%"]
+    
+    if correlation.supporting_evidence:
+        reasoning_parts.append(f"Evidence correlations ({len(correlation.supporting_evidence)} items):")
+        for ev in correlation.supporting_evidence[:3]:
+            reasoning_parts.append(f"  - {ev}")
+        if len(correlation.supporting_evidence) > 3:
+            reasoning_parts.append(f"  ... and {len(correlation.supporting_evidence) - 3} more")
+    
+    if llm_confidence is not None:
+        reasoning_parts.append(f"LLM assessed confidence: {llm_confidence}%")
+        reasoning_parts.append(f"Final weighted score: {final_confidence}%")
+    
+    return final_confidence, "\n".join(reasoning_parts)
+
+
+# ---------------------------------------------------------------------------
+# Main Orchestration
+# ---------------------------------------------------------------------------
+
+async def analyze_cluster(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    """
+    Main entry point: analyze Kubernetes diagnostics and return structured diagnosis.
+    
+    Args:
+        diagnostics: Investigation payload from Kubernetes layer
+        
+    Returns:
+        Dict with root_cause, explanation, fix, kubectl_command, prevention, confidence, severity
+    """
+    logger.info("Starting AI cluster analysis")
+    
+    # Step 1: Correlate evidence heuristically
+    correlation = analyze_root_cause(diagnostics)
+    logger.debug(f"Heuristic root cause: {correlation.root_cause}")
+    logger.debug(f"Evidence items: {len(correlation.supporting_evidence)}")
+    
+    # Step 2: Build prompt with full context
+    prompt = build_prompt(diagnostics)
+    logger.debug(f"Prompt built ({len(prompt)} chars)")
+    
+    # Step 3: Call LLM
+    client = OpenRouterClient()
+    try:
+        response_text = await client.chat_completion(prompt)
+        logger.debug(f"LLM response received")
+    except httpx.TimeoutException:
+        logger.error("OpenRouter API timeout")
+        return _fallback_diagnosis(correlation, "LLM timeout - using heuristic analysis only")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"OpenRouter API error: {e.response.status_code}")
+        return _fallback_diagnosis(correlation, f"LLM API error ({e.response.status_code}) - using heuristic analysis only")
+    except ValueError as e:
+        logger.error(f"OpenRouter configuration error: {e}")
+        return _fallback_diagnosis(correlation, f"LLM configuration error - using heuristic analysis only")
+    except Exception as e:
+        logger.error(f"Unexpected LLM error: {type(e).__name__}: {e}")
+        return _fallback_diagnosis(correlation, f"LLM error - using heuristic analysis only")
+    
+    # Step 4: Parse LLM response
+    try:
+        llm_result = json.loads(response_text)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse LLM JSON response, attempting extraction")
+        llm_result = _extract_json_from_text(response_text)
+        if not llm_result:
+            return _fallback_diagnosis(correlation, "Failed to parse LLM response")
+    
+    # Step 5: Validate and enhance with fix recommendation
+    root_cause = llm_result.get("root_cause", correlation.root_cause)
+    fix, kubectl_cmd = recommend_fix(root_cause, diagnostics)
+    
+    # Use LLM fix if it looks good, otherwise use our recommendation
+    llm_fix = llm_result.get("fix", "").strip()
+    if llm_fix and len(llm_fix) > 20:
+        fix = llm_fix
+    
+    llm_cmd = llm_result.get("kubectl_command", "").strip()
+    if llm_cmd and len(llm_cmd) > 10 and "kubectl" in llm_cmd:
+        kubectl_cmd = llm_cmd
+    
+    # Step 6: Calculate confidence
+    llm_conf = llm_result.get("confidence")
+    if isinstance(llm_conf, (int, float)):
+        llm_conf = int(llm_conf)
+    else:
+        llm_conf = None
+    
+    confidence, confidence_reasoning = calculate_confidence(correlation, llm_conf)
+    
+    # Step 7: Determine severity
+    severity = llm_result.get("severity", "medium")
+    if severity not in ["critical", "high", "medium", "low"]:
+        severity = "medium"
+    
+    # Adjust severity based on evidence
+    if any("CrashLoopBackOff" in e or "OOMKilled" in e for e in correlation.supporting_evidence):
+        severity = "high"
+    if any("ImagePullBackOff" in e or "ErrImagePull" in e for e in correlation.supporting_evidence):
+        severity = "critical"
+    
+    result = {
+        "root_cause": root_cause,
+        "explanation": llm_result.get("explanation", "Analysis based on correlated Kubernetes evidence"),
+        "fix": fix,
+        "kubectl_command": kubectl_cmd,
+        "prevention": llm_result.get("prevention", "Implement monitoring and alerting for early detection"),
+        "confidence": confidence,
+        "severity": severity
+    }
+    
+    logger.info(f"Analysis complete: {root_cause} (confidence: {confidence}%, severity: {severity})")
+    return result
+
+
+def _fallback_diagnosis(correlation: EvidenceCorrelation, reason: str) -> dict[str, Any]:
+    """Generate fallback diagnosis when LLM fails."""
+    fix, kubectl_cmd = recommend_fix(correlation.root_cause, {})
+    confidence, _ = calculate_confidence(correlation)
+    
+    return {
+        "root_cause": correlation.root_cause or "Unable to determine root cause",
+        "explanation": f"{reason}. Heuristic analysis found: {', '.join(correlation.supporting_evidence[:3]) or 'no specific evidence'}",
+        "fix": fix,
+        "kubectl_command": kubectl_cmd,
+        "prevention": "Implement comprehensive monitoring, logging, and alerting for Kubernetes workloads",
+        "confidence": max(confidence, 30),  # Minimum 30% for heuristic-only
+        "severity": "medium"
+    }
+
+
+def _extract_json_from_text(text: str) -> dict | None:
+    """Attempt to extract JSON from text that may have extra content."""
+    import re
+    
+    # Try to find JSON object in the text
+    json_match = re.search(r'\{[\s\S]*\}', text)
+    if json_match:
+        try:
+            return json.loads(json_match.group())
+        except json.JSONDecodeError:
+            pass
+    return None

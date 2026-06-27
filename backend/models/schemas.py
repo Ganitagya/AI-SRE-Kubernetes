@@ -2,7 +2,7 @@
 Pydantic models – shared data schemas.
 """
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from enum import Enum
 
@@ -18,15 +18,18 @@ class InvestigationRequest(BaseModel):
     """Request body for triggering a cluster investigation."""
     namespace: str = "default"
     include_logs: bool = False
+    user_id: Optional[str] = None
 
 
-class DiagnosisResult(BaseModel):
+class DiagnosisOutput(BaseModel):
     """Structured output from the AI reasoning layer."""
-    root_cause: Optional[str] = None
-    suggested_fix: Optional[str] = None
-    severity: Optional[SeverityLevel] = None
-    confidence: Optional[float] = None
-    raw_diagnostics: Optional[dict] = None
+    root_cause: str = Field(description="Primary root cause of the issue")
+    explanation: str = Field(description="Detailed explanation of the failure")
+    fix: str = Field(description="Actionable fix recommendation")
+    kubectl_command: str = Field(description="Specific kubectl command to apply the fix")
+    prevention: str = Field(description="Prevention recommendation for future")
+    confidence: int = Field(description="Confidence score 0-100", ge=0, le=100)
+    severity: SeverityLevel = Field(description="Severity level of the issue")
 
 
 class InvestigationResult(BaseModel):
@@ -42,4 +45,4 @@ class InvestigationResponse(BaseModel):
     """API response for investigation requests."""
     status: str
     investigation: InvestigationResult
-
+    diagnosis: Optional[DiagnosisOutput] = None

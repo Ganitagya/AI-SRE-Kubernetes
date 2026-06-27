@@ -8,7 +8,8 @@ from loguru import logger
 import sys
 
 from core.config import settings
-from api.routes import router
+from api.health import router as health_router
+from api.investigate import router as investigate_router
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -45,7 +46,8 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
-app.include_router(router)
+app.include_router(health_router, prefix="", tags=["Health"])
+app.include_router(investigate_router, prefix="", tags=["Investigate"])
 
 
 # ---------------------------------------------------------------------------

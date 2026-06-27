@@ -31,6 +31,8 @@ services:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_API_BASE_URL=http://backend:8000
+      - NEXT_PUBLIC_INSFORGE_URL=https://vsij6uxi.eu-central.insforge.app
+      - NEXT_PUBLIC_INSFORGE_ANON_KEY=ik_7d6daa277232104f47b52b0c31900ced
     depends_on:
       backend:
         condition: service_healthy

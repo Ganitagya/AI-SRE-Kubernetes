@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     # Kubernetes
     KUBECONFIG_PATH: str = "~/.kube/config"
 
+    # InsForge
+    INSFORGE_API_KEY: str = ""
+    INSFORGE_BASE_URL: str = ""
+
     # App
     APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"
