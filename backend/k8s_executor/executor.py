@@ -12,27 +12,47 @@ def get_kubeconfig() -> Optional[str]:
     Returns the path to the kubeconfig. If running in Docker, automatically
     patches localhost/127.0.0.1 to host.docker.internal so it can reach the host's clusters.
     """
-    original = Path("/root/.kube/config")
+    # Check for KUBECONFIG environment variable first
+    if os.environ.get("KUBECONFIG"):
+        kubeconfig_path = Path(os.environ["KUBECONFIG"])
+        if kubeconfig_path.exists():
+            original = kubeconfig_path
+        else:
+            return None
+    else:
+        # Check common locations for kubeconfig
+        home = Path.home()
+        possible_paths = [
+            home / ".kube" / "config",      # Standard location: ~/.kube/config
+            Path("/root/.kube/config"),     # Fallback to root's config
+        ]
+
+        original = None
+        for path in possible_paths:
+            if path.exists():
+                original = path
+                break
+
+        if original is None:
+            return None
+
     patched = Path("/tmp/patched_kubeconfig")
-    
-    if not original.exists():
-        return None
-        
+
     if os.environ.get("RUNNING_IN_DOCKER") == "true":
         try:
             with open(original, "r") as f:
                 content = f.read()
-                
+
             if "localhost" in content or "127.0.0.1" in content:
                 content = content.replace("localhost", "host.docker.internal")
                 content = content.replace("127.0.0.1", "host.docker.internal")
-                
+
                 with open(patched, "w") as f:
                     f.write(content)
                 return str(patched)
         except Exception as e:
             logger.warning(f"Could not patch kubeconfig: {e}")
-            
+
     return str(original)
 
 
@@ -106,7 +126,7 @@ def run_kubectl_command(args: list[str], namespace: Optional[str] = None, contex
     
     if context:
         cmd.extend(["--context", context])
-    elif namespace:
+    if namespace:
         cmd.extend(["-n", namespace])
     cmd.extend(args)
 
@@ -157,31 +177,3 @@ def run_kubectl_command(args: list[str], namespace: Optional[str] = None, contex
 
     return {"output": stdout}
 
-    logger.debug(f"Executing kubectl command: {' '.join(cmd)}")
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False  # We want to handle non-zero exit codes gracefully
-        )
-    except Exception as e:
-        logger.error(f"Failed to execute kubectl command '{' '.join(cmd)}': {str(e)}")
-        return {"error": f"Execution failed: {str(e)}"}
-
-    if result.returncode != 0:
-        logger.warning(f"kubectl command returned non-zero exit status {result.returncode}. Stderr: {result.stderr.strip()}")
-        return {"error": result.stderr.strip() or f"Command failed with exit code {result.returncode}"}
-
-    stdout = result.stdout.strip()
-    
-    # If the command expects JSON output, parse it
-    if "-o json" in " ".join(cmd) or "-o=json" in " ".join(cmd):
-        try:
-            return json.loads(stdout) if stdout else {}
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse kubectl JSON output: {str(e)}")
-            return {"error": f"Failed to parse JSON output: {str(e)}", "raw_output": stdout}
-
-    return {"output": stdout}

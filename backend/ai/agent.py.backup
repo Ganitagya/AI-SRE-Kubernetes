@@ -3,7 +3,7 @@ AI Kubernetes Agent – Senior SRE reasoning layer.
 
 This module implements:
 - Prompt Builder: Creates structured prompts for LLM
-- LLM Client: Requests-based NVIDIA client with retries/timeout
+- LLM Client: HTTPX-based OpenRouter client with retries/timeout
 - Root Cause Analyzer: Correlates evidence from investigation payload
 - Fix Recommendation Engine: Generates actionable kubectl commands
 - Confidence Engine: Produces confidence scores with reasoning
@@ -11,160 +11,147 @@ This module implements:
 
 import json
 import logging
-import base64
-from typing import Any, Dict, Optional
+from typing import Any
 from dataclasses import dataclass
 
-import requests
+import httpx
+from openai import AsyncOpenAI
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from core.config import settings
 
 
-def _extract_json(text: str) -> str:
-    """Extract JSON from text that may be wrapped in markdown code blocks."""
-    text = text.strip()
-    if text.startswith('```json'):
-        start = text.find('\n') + 1
-        end = text.rfind('```')
-        if start > 0 and end > start:
-            return text[start:end].strip()
-    elif text.startswith('```'):
-        start = text.find('\n') + 1
-        end = text.rfind('```')
-        if start > 0 and end > start:
-            return text[start:end].strip()
-    return text
-
-
 # ---------------------------------------------------------------------------
-# LLM Client – NVIDIA API
+# LLM Client – OpenRouter with HTTPX
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# LLM Client – OpenRouter with OpenAI SDK
 # ---------------------------------------------------------------------------
 
-
-class NVIDIAClient:
-    """NVIDIA API client with timeout, retries, and error handling."""
-
+class OpenRouterClient:
+    """OpenRouter API client with timeout, retries, and error handling using OpenAI SDK."""
+    
     def __init__(self, api_key: str | None = None, model: str | None = None):
-        self.api_key = api_key or settings.NVIDIA_API_KEY
-        self.model = model or settings.MODEL_NAME
-        self.base_url = settings.NVIDIA_BASE_URL.rstrip('/')
-
+        self.api_key = api_key or settings.OPENROUTER_API_KEY
+        self.model = model or settings.OPENROUTER_MODEL
+        
         if not self.api_key:
-            raise ValueError("NVIDIA_API_KEY not configured")
-        if not self.model:
-            raise ValueError("MODEL_NAME not configured")
-        if not self.base_url:
-            raise ValueError("NVIDIA_BASE_URL not configured")
-
-    def _get_system_prompt(self) -> str:
-        """System prompt for Kubernetes SRE analysis."""
-        return """You are an expert Kubernetes Site Reliability Engineer (SRE) with deep expertise in diagnosing and resolving Kubernetes cluster issues. Your task is to analyze Kubernetes diagnostic data (pods, logs, events, deployments, networking) and provide a structured diagnosis.
-
-You MUST return ONLY a valid JSON object with the following fields:
-- root_cause: string - The primary root cause of the issue (not symptoms)
-- explanation: string - Detailed explanation of how the evidence correlates to the root cause
-- fix: string - Actionable recommendation to fix the issue
-- kubectl_command: string - Specific kubectl command to implement the fix
-- prevention: string - Recommendation to prevent similar issues in the future
-- confidence: integer (0-100) - Confidence score based on evidence strength
-- severity: string (low/medium/high/critical) - Severity level of the issue
-
-Analyze the provided diagnostic data carefully. Focus on correlating evidence across different data sources (pod status, logs, events, deployments, networking) to identify the true root cause. Be specific and actionable in your recommendations."""
-
+            raise ValueError("OPENROUTER_API_KEY not configured")
+        
+        self.client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=self.api_key
+        )
+    
     @retry(
         wait=wait_exponential(multiplier=1, min=2, max=10),
         stop=stop_after_attempt(3),
-        retry=retry_if_exception_type((requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.HTTPError)),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError)),
         reraise=True
     )
-    def chat_completion(self, prompt: str, temperature: float = 0.1) -> str:
+    async def chat_completion(self, prompt: str, temperature: float = 0.1) -> str:
         """
-        Send prompt to NVIDIA API and return the response text.
-
+        Send prompt to OpenRouter and return the response text.
+        
         Args:
             prompt: The full prompt to send
             temperature: LLM temperature (low for deterministic output)
-
+            
         Returns:
             The assistant's response text
-
+            
         Raises:
-            requests.exceptions.HTTPError: On non-2xx response after retries
-            requests.exceptions.Timeout: On timeout after retries
+            httpx.HTTPStatusError: On non-2xx response after retries
+            httpx.TimeoutException: On timeout after retries
             ValueError: If API key is missing or response is empty
         """
         try:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            }
-
-            payload = {
-                "model": self.model,
-                "messages": [
+            completion = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
                     {"role": "system", "content": self._get_system_prompt()},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": temperature,
-                "max_tokens": 2000,
-                "stream": False
-            }
-
-            response = requests.post(
-                self.base_url,
-                headers=headers,
-                json=payload,
-                timeout=30.0  # 30 second timeout
+                temperature=temperature,
+                max_tokens=2000,
+                timeout=30.0  # Match original timeout
             )
-
-            # Raise an exception for bad status codes
-            response.raise_for_status()
-
-            result = response.json()
-
-            if not result.get("choices") or not result["choices"][0].get("message") or not result["choices"][0]["message"].get("content"):
-                raise ValueError("Empty or invalid response from NVIDIA API")
-
-            content = result["choices"][0]["message"]["content"]
-            logger.debug(f"NVIDIA API response received ({len(content)} chars): {content[:200]}")
+            
+            logger.debug(f"OpenRouter API call completed with model: {self.model}")
+            
+            if not completion.choices or not completion.choices[0].message.content:
+                raise ValueError("Empty response from OpenRouter")
+                
+            content = completion.choices[0].message.content
+            logger.debug(f"OpenRouter response received ({len(content)} chars)")
             return content.strip()
-
+            
         except Exception as e:
-            # Map requests exceptions to the expected exception types
+            # Map OpenAI SDK exceptions to the expected exception types
             # for compatibility with existing error handling in analyze_cluster
-
+            
             # Check if it's already one of the expected exception types
-            if isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.HTTPError)):
+            if isinstance(e, (httpx.TimeoutException, httpx.HTTPStatusError, ValueError)):
                 raise
-
-            # For any other exception, raise as-is to be caught by the general Exception handler
-            raise
-
+            
+            # Map OpenAI SDK exceptions to httpx exceptions where appropriate
+            from openai import APIConnectionError, APITimeoutError, RateLimitError, APIStatusError, AuthenticationError, BadRequestError
+            
+            if isinstance(e, APIConnectionError):
+                # Connection errors - treat as timeout for retry purposes
+                raise httpx.TimeoutException("Connection error", request=None) from e
+            elif isinstance(e, APITimeoutError):
+                raise httpx.TimeoutException("Request timeout", request=None) from e
+            elif isinstance(e, RateLimitError):
+                # Rate limit - create HTTPStatusError with 429 status
+                request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+                response = httpx.Response(429, request=request)
+                raise httpx.HTTPStatusError("Rate limited", request=request, response=response) from e
+            elif isinstance(e, AuthenticationError):
+                # Auth error - treat as invalid API key (ValueError like original)
+                raise ValueError("Invalid OpenRouter API key") from e
+            elif isinstance(e, BadRequestError):
+                # Bad request - create HTTPStatusError
+                request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+                response = httpx.Response(400, request=request)
+                raise httpx.HTTPStatusError("Bad request", request=request, response=response) from e
+            elif isinstance(e, APIStatusError):
+                # Other API errors - create HTTPStatusError with the status code
+                request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+                response = httpx.Response(e.status_code, request=request)
+                # Use the original response text if available, otherwise use a generic message
+                response_text = getattr(e, 'body', str(e)) if hasattr(e, 'body') else str(e)
+                if isinstance(response_text, dict):
+                    response_text = str(response_text)
+                response = httpx.Response(e.status_code, request=request, content=response_text.encode())
+                raise httpx.HTTPStatusError(f"Server error: {e.status_code}", request=request, response=response) from e
+            else:
+                # For any other exception, raise as-is to be caught by the general Exception handler
+                raise
 # Prompt Builder
 # ---------------------------------------------------------------------------
 
 def build_prompt(diagnostics: dict[str, Any]) -> str:
     """
     Build a structured Kubernetes troubleshooting prompt from investigation data.
-
+    
     Args:
         diagnostics: Investigation payload with pods, logs, events, deployments, network
-
+        
     Returns:
         Formatted prompt string for the LLM
     """
     sections = []
-
+    
     # Pods section
     pods = diagnostics.get("pods", {})
     if pods:
         problematic = pods.get("problematic_pods", [])
         total = pods.get("total_pods", 0)
         healthy = pods.get("healthy", True)
-
+        
         sections.append("=== POD STATUS ===")
         sections.append(f"Total pods: {total}")
         sections.append(f"Healthy: {healthy}")
@@ -174,7 +161,7 @@ def build_prompt(diagnostics: dict[str, Any]) -> str:
                 sections.append(f"  - {p.get('name', 'unknown')}: {p.get('status', 'unknown')}")
         else:
             sections.append("No problematic pods found")
-
+    
     # Logs section
     logs = diagnostics.get("logs", {})
     if logs:
@@ -186,13 +173,13 @@ def build_prompt(diagnostics: dict[str, Any]) -> str:
             sections.append(truncated)
             if len(log_content) > 3000:
                 sections.append(f"... (truncated, {len(log_content)} total chars)")
-
+    
     # Events section
     events = diagnostics.get("events", {})
     if events:
         anomalies = events.get("recent_anomalies", [])
         found = events.get("anomalies_found", False)
-
+        
         sections.append("\n=== KUBERNETES EVENTS ===")
         sections.append(f"Anomalies found: {found}")
         if anomalies:
@@ -200,14 +187,14 @@ def build_prompt(diagnostics: dict[str, Any]) -> str:
                 sections.append(f"  - [{e.get('reason', 'Unknown')}] {e.get('object', 'unknown')}: {e.get('message', '')} (count: {e.get('count', 1)})")
         else:
             sections.append("No warning events found")
-
+    
     # Deployments section
     deployments = diagnostics.get("deployments", {})
     if deployments:
         unhealthy = deployments.get("unhealthy_deployments", [])
         total = deployments.get("total_deployments", 0)
         healthy = deployments.get("healthy", True)
-
+        
         sections.append("\n=== DEPLOYMENT HEALTH ===")
         sections.append(f"Total deployments: {total}")
         sections.append(f"Healthy: {healthy}")
@@ -217,14 +204,14 @@ def build_prompt(diagnostics: dict[str, Any]) -> str:
                 sections.append(f"  - {d.get('name', 'unknown')}: desired={d.get('desired_replicas', 0)}, ready={d.get('ready_replicas', 0)}, unavailable={d.get('unavailable_replicas', 0)}")
         else:
             sections.append("All deployments healthy")
-
+    
     # Network section
     network = diagnostics.get("network", {})
     if network:
         issues = network.get("issues", [])
         total = network.get("total_services", 0)
         healthy = network.get("healthy", True)
-
+        
         sections.append("\n=== NETWORKING ===")
         sections.append(f"Total services: {total}")
         sections.append(f"Healthy: {healthy}")
@@ -234,9 +221,9 @@ def build_prompt(diagnostics: dict[str, Any]) -> str:
                 sections.append(f"  - {i.get('service', 'unknown')}: {i.get('issue', 'unknown')}")
         else:
             sections.append("No networking issues detected")
-
+    
     prompt = "\n".join(sections)
-
+    
     prompt += """
 
 === TASK ===
@@ -252,7 +239,7 @@ Think step by step:
 7. What severity level (critical/high/medium/low)?
 
 Return ONLY the JSON object specified in the system prompt."""
-
+    
     return prompt
 
 
@@ -271,22 +258,22 @@ class EvidenceCorrelation:
 def analyze_root_cause(diagnostics: dict[str, Any]) -> EvidenceCorrelation:
     """
     Correlate evidence from investigation payload to identify root cause.
-
+    
     This performs heuristic analysis before sending to LLM to provide
     structured context and validate LLM output.
     """
     evidence = []
     root_cause = "Unknown"
     confidence_boost = 0
-
+    
     # Check pod statuses
     pods = diagnostics.get("pods", {})
     problematic_pods = pods.get("problematic_pods", [])
-
+    
     for pod in problematic_pods:
         status = pod.get("status", "")
         pod_name = pod.get("name", "unknown")
-
+        
         if "CrashLoopBackOff" in status:
             evidence.append(f"Pod {pod_name} in CrashLoopBackOff - application crashing on startup")
             confidence_boost += 15
@@ -303,7 +290,7 @@ def analyze_root_cause(diagnostics: dict[str, Any]) -> EvidenceCorrelation:
             evidence.append(f"Pod {pod_name} stuck in Pending - scheduling issue")
             confidence_boost += 10
             root_cause = "Pod scheduling failure"
-
+    
     # Check logs for specific errors
     logs = diagnostics.get("logs", {})
     for pod_name, log_content in logs.items():
@@ -325,7 +312,7 @@ def analyze_root_cause(diagnostics: dict[str, Any]) -> EvidenceCorrelation:
         elif "out of memory" in log_lower or "oom" in log_lower:
             evidence.append(f"Pod {pod_name} logs confirm OOM")
             confidence_boost += 10
-
+    
     # Check events
     events = diagnostics.get("events", {})
     anomalies = events.get("recent_anomalies", [])
@@ -333,7 +320,7 @@ def analyze_root_cause(diagnostics: dict[str, Any]) -> EvidenceCorrelation:
         reason = event.get("reason", "")
         msg = event.get("message", "")
         obj = event.get("object", "")
-
+        
         if "FailedScheduling" in reason:
             evidence.append(f"Event: {obj} - {reason}: {msg}")
             confidence_boost += 10
@@ -345,14 +332,14 @@ def analyze_root_cause(diagnostics: dict[str, Any]) -> EvidenceCorrelation:
         elif "BackOff" in reason:
             evidence.append(f"Event: {obj} - {reason}: {msg}")
             confidence_boost += 5
-
+    
     # Check deployments
     deployments = diagnostics.get("deployments", {})
     unhealthy_deps = deployments.get("unhealthy_deployments", [])
     for dep in unhealthy_deps:
         evidence.append(f"Deployment {dep.get('name')}: {dep.get('unavailable_replicas', 0)} unavailable replicas")
         confidence_boost += 5
-
+    
     # Check network
     network = diagnostics.get("network", {})
     issues = network.get("issues", [])
@@ -362,7 +349,7 @@ def analyze_root_cause(diagnostics: dict[str, Any]) -> EvidenceCorrelation:
         if "selector mismatch" in issue.get("issue", "").lower():
             root_cause = "Service selector mismatch - pods not matching service selector"
             confidence_boost += 5
-
+    
     return EvidenceCorrelation(
         root_cause=root_cause,
         supporting_evidence=evidence,
@@ -377,12 +364,12 @@ def analyze_root_cause(diagnostics: dict[str, Any]) -> EvidenceCorrelation:
 def recommend_fix(root_cause: str, diagnostics: dict[str, Any]) -> tuple[str, str]:
     """
     Generate actionable fix and kubectl command based on root cause.
-
+    
     Returns:
         Tuple of (fix_description, kubectl_command)
     """
     rc_lower = root_cause.lower()
-
+    
     # Database/env var issues
     if "database_url" in rc_lower or "environment variable" in rc_lower or "missing env" in rc_lower:
         pods = diagnostics.get("pods", {}).get("problematic_pods", [])
@@ -390,22 +377,22 @@ def recommend_fix(root_cause: str, diagnostics: dict[str, Any]) -> tuple[str, st
         # Try to find deployment name
         deployments = diagnostics.get("deployments", {}).get("unhealthy_deployments", [])
         dep_name = deployments[0].get("name", "your-deployment") if deployments else "your-deployment"
-
+        
         fix = "Add the missing DATABASE_URL environment variable to the deployment"
         cmd = f"kubectl set env deployment/{dep_name} DATABASE_URL=your-database-url"
         return fix, cmd
-
+    
     # Image pull issues
     if "image pull" in rc_lower or "imagepull" in rc_lower or "errimagepull" in rc_lower:
         pods = diagnostics.get("pods", {}).get("problematic_pods", [])
         pod_name = pods[0].get("name", "your-pod") if pods else "your-pod"
-
+        
         fix = "Fix container image reference or provide image pull secrets"
         cmd = ("kubectl describe pod " + pod_name + "  # Check image name and pull secrets\n"
                "kubectl create secret docker-registry regcred --docker-server=<registry> --docker-username=<user> --docker-password=<pass> --docker-email=<email>\n"
                "kubectl patch serviceaccount default -p '{\\\"imagePullSecrets\\\": [{\\\"name\\\": \\\"regcred\\\"}]}'")
         return fix, cmd
-
+    
     # OOM issues
     if "oom" in rc_lower or "memory" in rc_lower:
         pods = diagnostics.get("pods", {}).get("problematic_pods", [])
@@ -413,45 +400,45 @@ def recommend_fix(root_cause: str, diagnostics: dict[str, Any]) -> tuple[str, st
         deployments = diagnostics.get("deployments", {}).get("unhealthy_deployments", [])
         if deployments:
             dep_name = deployments[0].get("name", "your-deployment")
-
+        
         fix = "Increase memory limits for the container"
         cmd = f"kubectl set resources deployment/{dep_name} --limits=memory=512Mi --requests=memory=256Mi  # Adjust values as needed"
         return fix, cmd
-
+    
     # Scheduling issues
     if "schedul" in rc_lower or "pending" in rc_lower:
         fix = "Resolve scheduling constraints - check node resources, taints/tolerations, affinity rules"
         cmd = "kubectl describe pod <pod-name>  # Check events for scheduling reason\nkubectl get nodes -o wide  # Check node capacity\nkubectl describe node <node-name>  # Check taints"
         return fix, cmd
-
+    
     # Volume mount issues
     if "volume" in rc_lower or "mount" in rc_lower:
         fix = "Fix volume configuration - check PVC binding, storage class, volume permissions"
         cmd = "kubectl get pvc -n <namespace>  # Check PVC status\nkubectl describe pvc <pvc-name>  # Check events\nkubectl get storageclass  # Check available storage classes"
         return fix, cmd
-
+    
     # Service selector mismatch
     if "selector" in rc_lower or "service" in rc_lower:
         network = diagnostics.get("network", {})
         issues = network.get("issues", [])
         svc_name = issues[0].get("service", "your-service") if issues else "your-service"
-
+        
         fix = "Fix service selector to match pod labels"
-        cmd = f"kubectl get pods --show-labels  # Check pod labels\nkubectl get svc {svc_name} -o yaml  # Check service selector\nkubectl patch svc {svc_name} -p '{{\\\"spec\\\": {{\\\"selector\\\": {{\\\"app\\\": \\\"your-app-label\\\"}}}}}}'  # Update selector"
+        cmd = f"kubectl get pods --show-labels  # Check pod labels\nkubectl get svc {svc_name} -o yaml  # Check service selector\nkubectl patch svc {svc_name} -p '{{\"spec\": {{\"selector\": {{\"app\": \"your-app-label\"}}}}}}'  # Update selector"
         return fix, cmd
-
+    
     # Permission/RBAC issues
     if "permission" in rc_lower or "rbac" in rc_lower or "access denied" in rc_lower:
         fix = "Grant required RBAC permissions via Role/ClusterRole binding"
         cmd = "kubectl auth can-i <verb> <resource> --as=<service-account> -n <namespace>  # Check permissions\nkubectl create rolebinding <name> --role=<role> --serviceaccount=<ns>:<sa> -n <namespace>"
         return fix, cmd
-
+    
     # ConfigMap/Secret missing
     if "configmap" in rc_lower or "secret" in rc_lower:
         fix = "Create missing ConfigMap or Secret and mount it to the pod"
         cmd = "kubectl create configmap <name> --from-literal=key=value -n <namespace>\n# OR\nkubectl create secret generic <name> --from-literal=key=value -n <namespace>"
         return fix, cmd
-
+    
     # Generic fallback
     fix = "Investigate the root cause further using kubectl describe and logs"
     cmd = "kubectl describe pod <pod-name> -n <namespace>\nkubectl logs <pod-name> -n <namespace> --previous"
@@ -468,43 +455,43 @@ def calculate_confidence(
 ) -> tuple[int, str]:
     """
     Calculate final confidence score with reasoning.
-
+    
     Args:
         correlation: Evidence correlation from analyzer
         llm_confidence: Optional confidence from LLM response
-
+        
     Returns:
         Tuple of (confidence_score, reasoning)
     """
     base_confidence = 50  # Base confidence
-
+    
     # Add heuristic boost from evidence correlation
     base_confidence += correlation.confidence_boost
-
+    
     # Factor in LLM confidence if available
     if llm_confidence is not None:
         # Weighted average: 60% LLM, 40% heuristic
         final_confidence = int(0.6 * llm_confidence + 0.4 * base_confidence)
     else:
         final_confidence = base_confidence
-
+    
     # Clamp to 0-100
     final_confidence = max(0, min(100, final_confidence))
-
+    
     # Build reasoning
     reasoning_parts = [f"Base confidence: {base_confidence}%"]
-
+    
     if correlation.supporting_evidence:
         reasoning_parts.append(f"Evidence correlations ({len(correlation.supporting_evidence)} items):")
         for ev in correlation.supporting_evidence[:3]:
             reasoning_parts.append(f"  - {ev}")
         if len(correlation.supporting_evidence) > 3:
             reasoning_parts.append(f"  ... and {len(correlation.supporting_evidence) - 3} more")
-
+    
     if llm_confidence is not None:
         reasoning_parts.append(f"LLM assessed confidence: {llm_confidence}%")
         reasoning_parts.append(f"Final weighted score: {final_confidence}%")
-
+    
     return final_confidence, "\n".join(reasoning_parts)
 
 
@@ -512,87 +499,126 @@ def calculate_confidence(
 # Main Orchestration
 # ---------------------------------------------------------------------------
 
-def analyze_cluster(diagnostics: dict[str, Any]) -> dict[str, Any]:
+async def analyze_cluster(diagnostics: dict[str, Any]) -> dict[str, Any]:
     """
     Main entry point: analyze Kubernetes diagnostics and return structured diagnosis.
-
+    
     Args:
         diagnostics: Investigation payload from Kubernetes layer
-
+        
     Returns:
         Dict with root_cause, explanation, fix, kubectl_command, prevention, confidence, severity
     """
     logger.info("Starting AI cluster analysis")
-
+    
     # Step 1: Correlate evidence heuristically
     correlation = analyze_root_cause(diagnostics)
     logger.debug(f"Heuristic root cause: {correlation.root_cause}")
     logger.debug(f"Evidence items: {len(correlation.supporting_evidence)}")
-
+    
     # Step 2: Build prompt with full context
     prompt = build_prompt(diagnostics)
     logger.debug(f"Prompt built ({len(prompt)} chars)")
-
+    
     # Step 3: Call LLM
-    client = NVIDIAClient()
+    client = OpenRouterClient()
     try:
-        response_text = client.chat_completion(prompt)
-        response_text = _extract_json(response_text)
+        response_text = await client.chat_completion(prompt)
         logger.debug(f"LLM response received")
-    except requests.exceptions.Timeout:
-        logger.error("NVIDIA API timeout")
+    except httpx.TimeoutException:
+        logger.error("OpenRouter API timeout")
         return _fallback_diagnosis(correlation, "LLM timeout - using heuristic analysis only")
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"NVIDIA API connection error: {e}")
-        return _fallback_diagnosis(correlation, f"LLM connection error - using heuristic analysis only")
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"NVIDIA API error: {e.response.status_code if e.response else 'Unknown'}")
-        return _fallback_diagnosis(correlation, f"LLM API error ({e.response.status_code if e.response else 'Unknown'}) - using heuristic analysis only")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"OpenRouter API error: {e.response.status_code}")
+        return _fallback_diagnosis(correlation, f"LLM API error ({e.response.status_code}) - using heuristic analysis only")
     except ValueError as e:
-        logger.error(f"NVIDIA configuration error: {e}")
+        logger.error(f"OpenRouter configuration error: {e}")
         return _fallback_diagnosis(correlation, f"LLM configuration error - using heuristic analysis only")
     except Exception as e:
         logger.error(f"Unexpected LLM error: {type(e).__name__}: {e}")
         return _fallback_diagnosis(correlation, f"LLM error - using heuristic analysis only")
-
+    
     # Step 4: Parse LLM response
     try:
-        # Try to parse as JSON
-        result = json.loads(response_text)
-
-        # Validate required fields
-        required_fields = ["root_cause", "explanation", "fix", "kubectl_command", "prevention", "confidence", "severity"]
-        for field in required_fields:
-            if field not in result:
-                raise ValueError(f"Missing required field: {field}")
-
-        # Ensure confidence is integer
-        result["confidence"] = int(result["confidence"])
-
-        # Blend with heuristic confidence if needed
-        heuristic_confidence, _ = calculate_confidence(correlation)
-        # Weighted average: 70% LLM, 30% heuristic
-        result["confidence"] = int(0.7 * result["confidence"] + 0.3 * heuristic_confidence)
-        result["confidence"] = max(0, min(100, result["confidence"]))
-
-        return result
-
-    except (json.JSONDecodeError, ValueError, KeyError) as e:
-        logger.error(f"Failed to parse LLM response: {e}")
-        return _fallback_diagnosis(correlation, f"LLM response parsing failed - using heuristic analysis only")
+        llm_result = json.loads(response_text)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse LLM JSON response, attempting extraction")
+        llm_result = _extract_json_from_text(response_text)
+        if not llm_result:
+            return _fallback_diagnosis(correlation, "Failed to parse LLM response")
+    
+    # Step 5: Validate and enhance with fix recommendation
+    root_cause = llm_result.get("root_cause", correlation.root_cause)
+    fix, kubectl_cmd = recommend_fix(root_cause, diagnostics)
+    
+    # Use LLM fix if it looks good, otherwise use our recommendation
+    llm_fix = llm_result.get("fix", "").strip()
+    if llm_fix and len(llm_fix) > 20:
+        fix = llm_fix
+    
+    llm_cmd = llm_result.get("kubectl_command", "").strip()
+    if llm_cmd and len(llm_cmd) > 10 and "kubectl" in llm_cmd:
+        kubectl_cmd = llm_cmd
+    
+    # Step 6: Calculate confidence
+    llm_conf = llm_result.get("confidence")
+    if isinstance(llm_conf, (int, float)):
+        llm_conf = int(llm_conf)
+    else:
+        llm_conf = None
+    
+    confidence, confidence_reasoning = calculate_confidence(correlation, llm_conf)
+    
+    # Step 7: Determine severity
+    severity = llm_result.get("severity", "medium")
+    if severity not in ["critical", "high", "medium", "low"]:
+        severity = "medium"
+    
+    # Adjust severity based on evidence
+    if any("CrashLoopBackOff" in e or "OOMKilled" in e for e in correlation.supporting_evidence):
+        severity = "high"
+    if any("ImagePullBackOff" in e or "ErrImagePull" in e for e in correlation.supporting_evidence):
+        severity = "critical"
+    
+    result = {
+        "root_cause": root_cause,
+        "explanation": llm_result.get("explanation", "Analysis based on correlated Kubernetes evidence"),
+        "fix": fix,
+        "kubectl_command": kubectl_cmd,
+        "prevention": llm_result.get("prevention", "Implement monitoring and alerting for early detection"),
+        "confidence": confidence,
+        "severity": severity
+    }
+    
+    logger.info(f"Analysis complete: {root_cause} (confidence: {confidence}%, severity: {severity})")
+    return result
 
 
 def _fallback_diagnosis(correlation: EvidenceCorrelation, reason: str) -> dict[str, Any]:
-    """Generate a fallback diagnosis when LLM fails."""
-    fix, cmd = recommend_fix(correlation.root_cause, {})
-    confidence, reasoning = calculate_confidence(correlation)
-
+    """Generate fallback diagnosis when LLM fails."""
+    fix, kubectl_cmd = recommend_fix(correlation.root_cause, {})
+    confidence, _ = calculate_confidence(correlation)
+    
     return {
-        "root_cause": correlation.root_cause,
-        "explanation": f"{reason}\n\nHeuristic analysis found: {', '.join(correlation.supporting_evidence[:3])}",
+        "root_cause": correlation.root_cause or "Unable to determine root cause",
+        "explanation": f"{reason}. Heuristic analysis found: {', '.join(correlation.supporting_evidence[:3]) or 'no specific evidence'}",
         "fix": fix,
-        "kubectl_command": cmd,
-        "prevention": "Regular monitoring and proactive health checks can prevent similar issues.",
-        "confidence": confidence,
-        "severity": "medium"  # Default severity for fallback
+        "kubectl_command": kubectl_cmd,
+        "prevention": "Implement comprehensive monitoring, logging, and alerting for Kubernetes workloads",
+        "confidence": max(confidence, 30),  # Minimum 30% for heuristic-only
+        "severity": "medium"
     }
+
+
+def _extract_json_from_text(text: str) -> dict | None:
+    """Attempt to extract JSON from text that may have extra content."""
+    import re
+    
+    # Try to find JSON object in the text
+    json_match = re.search(r'\{[\s\S]*\}', text)
+    if json_match:
+        try:
+            return json.loads(json_match.group())
+        except json.JSONDecodeError:
+            pass
+    return None

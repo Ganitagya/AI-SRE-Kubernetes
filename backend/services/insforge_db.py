@@ -8,6 +8,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Optional
+from models.schemas import DiagnosisOutput
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ class InsForgeDB:
     
     async def _request(self, method: str, path: str, json_data: dict = None) -> httpx.Response:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            url = f"{self.base_url}/rest/v1{path}"
+            url = f"{self.base_url}/api/database/records{path}"
             response = await client.request(method, url, headers=self.headers, json=json_data)
             if response.status_code >= 400:
                 logger.error(f"InsForge DB {method} {path} failed: {response.status_code} - {response.text}")
@@ -158,5 +159,84 @@ class InsForgeDB:
             raise
 
 
+    async def get_investigation_history(
+        self,
+        user_id: str,
+        limit: int = 50,
+        offset: int = 0
+    ) -> list[dict]:
+        """Get investigation history for a user."""
+        try:
+            params = {
+                'user_id': f'eq.{user_id}',
+                'order': 'created_at.desc',
+                'limit': str(limit),
+                'offset': str(offset)
+            }
+            response = await self._request('GET', '/investigation_history', params)
+            return response.json()
+        except Exception as e:
+            logger.error(f"Failed to get investigation history: {e}")
+            return []
+
+    async def get_investigation_by_id(
+        self,
+        investigation_id: str
+    ) -> dict | None:
+        """Get a specific investigation by ID."""
+        try:
+            response = await self._request(
+                'GET',
+                f'/investigation_history?id=eq.{investigation_id}'
+            )
+            result = response.json()
+            return result[0] if result and len(result) > 0 else None
+        except Exception as e:
+            logger.error(f"Failed to get investigation by ID: {e}")
+            return None
+
+    async def get_investigation_progress(
+        self,
+        investigation_id: str
+    ) -> list[dict]:
+        """Get progress records for an investigation."""
+        try:
+            response = await self._request(
+                'GET',
+                f'/investigation_progress?investigation_id=eq.{investigation_id}&order=created_at.asc'
+            )
+            return response.json()
+        except Exception as e:
+            logger.error(f"Failed to get investigation progress: {e}")
+            return []
+
+    async def update_investigation_history(
+        self,
+        investigation_id: str,
+        diagnosis: DiagnosisOutput,
+        investigation_data: dict
+    ) -> bool:
+        """Update an investigation history record with AI diagnosis results."""
+        try:
+            data = {
+                'root_cause': diagnosis.root_cause,
+                'explanation': diagnosis.explanation,
+                'fix': diagnosis.fix,
+                'kubectl_command': diagnosis.kubectl_command,
+                'prevention': diagnosis.prevention,
+                'confidence': diagnosis.confidence,
+                'severity': diagnosis.severity.value if hasattr(diagnosis.severity, 'value') else str(diagnosis.severity),
+                'raw_diagnostics': investigation_data
+            }
+
+            response = await self._request(
+                'PATCH',
+                f'/investigation_history?id=eq.{investigation_id}',
+                data
+            )
+            return response.status_code in (200, 204)
+        except Exception as e:
+            logger.error(f"Failed to update investigation history: {e}")
+            return False
 # Global instance
 insforge_db = InsForgeDB()

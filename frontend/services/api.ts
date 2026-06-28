@@ -8,7 +8,7 @@ import axios from 'axios';
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
 
-export const apiClient = axios.create({
+const apiClient = axios.create({
   baseURL: API_BASE_URL,
   timeout: 120_000, // 2 minutes for investigation
   headers: {
@@ -20,6 +20,21 @@ export const apiClient = axios.create({
 // Types
 // ─────────────────────────────────────────────────────────
 
+export type InvestigationStatus = 'completed' | 'failed';
+
+export interface InvestigationHistoryItem {
+  id: string;
+  created_at: string;
+  namespace: string;
+  root_cause: string;
+  confidence: number;
+  severity: SeverityLevel;
+  status: InvestigationStatus;
+  context?: string; // Kubernetes context used for investigation
+}
+
+export type SeverityLevel = 'low' | 'medium' | 'high' | 'critical';
+
 export interface HealthResponse {
   status: string;
   service: string;
@@ -29,18 +44,7 @@ export interface InvestigationRequest {
   namespace: string;
   include_logs?: boolean;
   user_id?: string;
-}
-
-export type SeverityLevel = 'low' | 'medium' | 'high' | 'critical';
-
-export interface DiagnosisOutput {
-  root_cause: string;
-  explanation: string;
-  fix: string;
-  kubectl_command: string;
-  prevention: string;
-  confidence: number;
-  severity: SeverityLevel;
+  context?: string; // Kubernetes context to use
 }
 
 export interface InvestigationResult {
@@ -52,20 +56,20 @@ export interface InvestigationResult {
   id?: string;
 }
 
+export interface DiagnosisOutput {
+  root_cause: string;
+  explanation: string;
+  fix: string;
+  kubectl_command: string;
+  prevention: string;
+  confidence: number;
+  severity: SeverityLevel;
+}
+
 export interface InvestigationResponse {
   status: string;
   investigation: InvestigationResult;
   diagnosis: DiagnosisOutput | null;
-}
-
-export interface InvestigationHistoryItem {
-  id: string;
-  created_at: string;
-  namespace: string;
-  root_cause: string;
-  confidence: number;
-  severity: SeverityLevel;
-  status: 'completed' | 'failed';
 }
 
 // ─────────────────────────────────────────────────────────
@@ -81,9 +85,16 @@ export async function checkHealth(): Promise<HealthResponse> {
 // ─────────────────────────────────────────────────────────
 export async function runInvestigation(
   namespace = 'default',
-  userId?: string
+  userId?: string,
+  context?: string,
+  deepScan: boolean = false
 ): Promise<InvestigationResponse> {
-  const { data } = await apiClient.post('/investigate', { namespace, user_id: userId });
+  const { data } = await apiClient.post('/investigate', {
+    namespace,
+    user_id: userId,
+    context,
+    deep_scan: deepScan
+  });
   return data;
 }
 

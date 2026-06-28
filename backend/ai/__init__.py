@@ -1,7 +1,6 @@
 """AI Kubernetes Agent – Senior SRE reasoning layer."""
 
 from .agent import (
-    OpenRouterClient,
     build_prompt,
     analyze_root_cause,
     recommend_fix,
@@ -10,7 +9,6 @@ from .agent import (
 )
 
 __all__ = [
-    "OpenRouterClient",
     "build_prompt",
     "analyze_root_cause",
     "recommend_fix",

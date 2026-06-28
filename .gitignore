@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .env
+.env.*
 .venv/
 venv/
 *.egg-info/
@@ -39,3 +40,6 @@ Thumbs.db
 .roo
 .trae
 .windsurf
+
+# Misc
+.mcp.json

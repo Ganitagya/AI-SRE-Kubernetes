@@ -10,6 +10,7 @@ import sys
 from core.config import settings
 from api.health import router as health_router
 from api.investigate import router as investigate_router
+from api.contexts import router as contexts_router
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -48,6 +49,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 app.include_router(health_router, prefix="", tags=["Health"])
 app.include_router(investigate_router, prefix="", tags=["Investigate"])
+app.include_router(contexts_router, prefix="", tags=["Contexts"])
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +58,7 @@ app.include_router(investigate_router, prefix="", tags=["Investigate"])
 @app.on_event("startup")
 async def startup_event():
     logger.info("AI Kubernetes Agent backend starting up...")
-    logger.info(f"OpenRouter model: {settings.OPENROUTER_MODEL}")
+    logger.info(f"Model: {settings.MODEL_NAME}")
     logger.info(f"Kubeconfig path: {settings.KUBECONFIG_PATH}")
 
 

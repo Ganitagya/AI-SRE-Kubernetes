@@ -1,9 +1,7 @@
-"use client";
+"@react-navigation/native";
 
-/**
- * app/(dashboard)/layout.tsx – Protected dashboard layout with auth guard.
- * Redirects to login if user is not authenticated.
- */
+// app/(dashboard)/layout.tsx – Protected dashboard layout with auth guard.
+// Redirects to login if user is not authenticated.
 
 import { useEffect } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
@@ -17,9 +15,12 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   useEffect(() => {
     if (isLoaded && !user) {
-      router.push('/login');
+      // Redirect to login with current path as redirect destination
+      const searchParams = new URLSearchParams();
+      searchParams.set('callbackUrl', pathname);
+      router.push(`/login?${searchParams.toString()}`);
     }
-  }, [isLoaded, user, router]);
+  }, [isLoaded, user, pathname, router]);
 
   // Show loading while checking auth
   if (!isLoaded) {
@@ -36,11 +37,12 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     );
   }
 
-  // Don't render children if not authenticated
+  // If user is not authenticated, don't render the layout (redirect will happen in useEffect)
   if (!user) {
     return null;
   }
 
+  // User is authenticated - show dashboard layout
   return (
     <div className="min-h-screen bg-slate-950">
       <DashboardHeader user={user} />

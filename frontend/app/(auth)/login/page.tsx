@@ -1,10 +1,12 @@
 "use client";
 
+export const dynamic = 'force-dynamic';
+
 /**
  * app/(auth)/login/page.tsx – Login/Signup/Verify page with InsForge authentication.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/context/AuthProvider';
 
@@ -22,6 +24,19 @@ export default function LoginPage() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [callbackUrl, setCallbackUrl] = useState<string | null>(null);
+
+  // Read callbackUrl from URL query params on the client only
+  useEffect(() => {
+    // Only run on the client
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href);
+      const cb = url.searchParams.get('callbackUrl');
+      if (cb) {
+        setCallbackUrl(cb);
+      }
+    }
+  }, []);
 
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -36,7 +51,9 @@ export default function LoginPage() {
       }
       // Refresh user to ensure session is loaded
       await refreshUser();
-      router.push('/');
+      // Redirect to callbackUrl if available, otherwise home
+      const redirectUrl = callbackUrl || '/';
+      router.push(redirectUrl);
       router.refresh();
     } catch (err) {
       setError('An unexpected error occurred');
@@ -58,6 +75,7 @@ export default function LoginPage() {
       }
       // Switch to verify mode
       setMode('verify');
+      setOtp('');
       setSuccess('Account created! Please enter the 6-digit code sent to your email.');
     } catch (err) {
       setError('An unexpected error occurred');
@@ -141,7 +159,7 @@ export default function LoginPage() {
               <path
                 strokeLinecap="round"
                 strokeLinejoin="round"
-                d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0H3"
+                d="M9 17.25v1.007a3 3 0 01-.879 2.122L7.5 21h9l-.621-.621A3 3 0 0115 18.257V17.25m6-12V15a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 003 15V5.25m18 0A2.25 2.25 0 0018.75 3H5.25A2.25 2.25 0 003 5.25m18 0H3"
               />
             </svg>
           </div>

@@ -1,0 +1,7 @@
+- [Session Summary 2026-06-27](memory/session-summary-2026-06-27.md) — Summary of work done and continuation instructions
+- [Fix InsForge API path and duplicate methods](memory/fix-insforge-api-path.md) — Fixed 404 errors when communicating with InsForge API by correcting the endpoint path and removing duplicate method descriptions
+- [Update Dashboard Layout](memory/update-dashboard-layout.md) — Modified dashboard to show investigation history always, progress only during investigation, and diagnosis only after investigation
+- [Add User Banner](memory/add-user-banner.md) — Added a banner at the top of DashboardPage showing user email and logout button
+- [Fix Investigation Progress Persistence](memory/fix-investigation-progress-persistence.md) — Fixed investigation progress UI to show completed steps after investigation ends instead of resetting to pending
+- [Fix Investigation Progress Visibility](memory/fix-investigation-progress-visibility.md) — Fixed investigation progress to remain visible until all stages are complete, and show progress even after investigation finishes (with completed steps)
+- [Beautify User Banner](memory/beautify-user-banner.md) — Improved the user banner styling with glassmorphism, better spacing, and hover effects

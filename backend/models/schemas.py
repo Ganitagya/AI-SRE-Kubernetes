@@ -19,6 +19,8 @@ class InvestigationRequest(BaseModel):
     namespace: str = "default"
     include_logs: bool = False
     user_id: Optional[str] = None
+    context: Optional[str] = None  # Kubernetes context to use
+    deep_scan: bool = False  # Whether to perform a deep scan (logs for all pods)
 
 
 class DiagnosisOutput(BaseModel):
@@ -34,11 +36,18 @@ class DiagnosisOutput(BaseModel):
 
 class InvestigationResult(BaseModel):
     """Structured output from the Kubernetes investigation layer."""
+    id: Optional[str] = None
     pods: dict = {}
     logs: dict = {}
     events: dict = {}
     deployments: dict = {}
     network: dict = {}
+    # Raw data from kubectl commands for debugging
+    pods_raw: Optional[dict] = None
+    logs_raw: Optional[dict] = None
+    events_raw: Optional[dict] = None
+    deployments_raw: Optional[dict] = None
+    network_raw: Optional[dict] = None
 
 
 class InvestigationResponse(BaseModel):
